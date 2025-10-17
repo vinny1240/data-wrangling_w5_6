@@ -1,0 +1,953 @@
+---
+title: "NHANES 2021-2023 Data Analysis: Cleaning, Wrangling, and Visualization"
+author: "B11801014 Vincent Lin"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    code_folding: show
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+  word_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 300
+)
+```
+# Introduction
+
+This report analyzes data from the **National Health and Nutrition Examination Survey (NHANES)** conducted between **August 2021 and August 2023**.  
+
+The purpose of this analysis is to **clean and explore variables** related to:
+
+- **Body measures:** BMI  
+- **Blood pressure:** Systolic (SBP) and Diastolic (DBP)  
+- **Demographics:** Age, sex, education, and race/ethnicity  
+
+Key objectives include:
+
+- Examining associations such as **BMI with SBP by sex**  
+- Exploring **distributions across education and race levels**  
+- Assessing **variability in blood pressure measurements** across multiple trials  
+
+All analyses are conducted using **R**, ensuring full **reproducibility** through documented code chunks.
+
+# Week 5 Class: BMI Cleaning & Visualization
+
+## Setup and Data Loading
+
+```{r load-packages}
+# Load required packages
+pkgs <- c("tidyverse", "haven", "janitor", "stringr", "scales", 
+          "skimr", "naniar", "knitr", "ggpmisc")
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# Set working directory (adjust as needed)
+setwd("/Users/vinny/Desktop/class55")
+data_dir <- "data_raw"
+```
+
+```{r load-data}
+# Load raw data
+demo <- read_xpt(file.path(data_dir, "DEMO_L.XPT")) %>% clean_names()
+bpx  <- read_xpt(file.path(data_dir, "BPXO_L.XPT")) %>% clean_names()
+bmx  <- read_xpt(file.path(data_dir, "BMX_L.XPT"))  %>% clean_names()
+```
+
+## Data Overview
+
+```{r data-overview}
+# Quick data overview
+skimr::skim(demo)
+skimr::skim(bpx)
+skimr::skim(bmx)
+```
+
+## Missing Values Visualization
+
+```{r missing-plot}
+gg_miss_var(bpx, show_pct = TRUE) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Proportion of Missing Values per Variable in Blood Pressure Data")
+```
+
+## Detect Blood Pressure Columns
+
+```{r detect-bp-cols}
+# Detect systolic and diastolic BP columns
+sbp_cols <- names(bpx)[stringr::str_detect(names(bpx), "^bpxo?sy[1-3]$")]
+dbp_cols <- names(bpx)[stringr::str_detect(names(bpx), "^bpxo?di[1-3]$")]
+
+cat("SBP columns:", sbp_cols, "\n")
+cat("DBP columns:", dbp_cols, "\n")
+```
+
+## Build BEFORE (Raw) Dataset
+
+```{r build-raw-bmi}
+# Extract raw BMI
+bmi_raw <- bmx %>%
+  transmute(seqn, bmi_raw = bmxbmi)
+
+# Check gender distribution
+table(demo$riagendr)
+
+# Clean demographics
+demo <- demo %>%
+  mutate(riagendr = as.numeric(riagendr)) %>%
+  filter(is.na(riagendr) | riagendr %in% c(1, 2))
+
+demo_sex <- demo %>%
+  transmute(
+    seqn, 
+    age = ridageyr,
+    sex = factor(riagendr, levels = c(1, 2), labels = c("Male", "Female"))
+  )
+
+# Combine data
+dat_raw <- demo_sex %>%
+  left_join(bmi_raw, by = "seqn") %>%
+  filter(age >= 20) %>%
+  mutate(bmi_raw = ifelse(is.nan(bmi_raw), NA_real_, bmi_raw))
+```
+
+## BMI Distribution (BEFORE Cleaning)
+
+```{r plot-bmi-before}
+bmi_before_df <- dat_raw %>% transmute(stage = "Before (raw BMI)", value = bmi_raw)
+x <- bmi_before_df$value
+qs <- quantile(x, c(.25, .75), na.rm = TRUE)
+iqr <- qs[2] - qs[1]
+upper_whisker <- min(max(x, na.rm = TRUE), qs[2] + 1.5 * iqr)
+bmi_before_label_y <- upper_whisker + 0.05 * iqr
+bmi_before_N <- sum(!is.na(x))
+
+ggplot(bmi_before_df, aes(stage, value, fill = stage)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.15, fatten = 1.2) +
+  geom_text(
+    data = tibble(stage = "Before (raw BMI)", y = bmi_before_label_y, N = bmi_before_N),
+    aes(stage, y, label = paste0("n = ", N)), 
+    hjust = -1, size = 3.5, inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = c("Before (raw BMI)" = "#D6E9F8")) +
+  labs(title = "BMI (BEFORE): Raw Distribution", x = NULL, y = "BMI") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  theme_minimal(base_size = 12) + 
+  theme(legend.position = "none", panel.grid.minor = element_blank())
+```
+
+## Outlier Cleaning
+
+```{r clean-bmi}
+BMI_LO <- 10
+BMI_HI <- 80
+
+bmi_clean <- bmx %>%
+  transmute(seqn, bmxbmi) %>%
+  mutate(
+    q1 = quantile(bmxbmi, 0.25, na.rm = TRUE),
+    q3 = quantile(bmxbmi, 0.75, na.rm = TRUE),
+    iqr = q3 - q1,
+    lo_iqr = q1 - 1.5 * iqr,
+    hi_iqr = q3 + 1.5 * iqr,
+    med = median(bmxbmi, na.rm = TRUE),
+    madv = mad(bmxbmi, na.rm = TRUE),
+    z = ifelse(madv > 0, (bmxbmi - med) / (madv * 1.4826), 0),
+    flag = (bmxbmi < BMI_LO | bmxbmi > BMI_HI) | 
+           (bmxbmi < lo_iqr | bmxbmi > hi_iqr) | 
+           (abs(z) > 3.5),
+    bmxbmi_clean = ifelse(flag, NA_real_, bmxbmi)
+  ) %>% 
+  select(seqn, bmxbmi_clean)
+
+# Build cleaned dataset
+dat_clean <- demo_sex %>%
+  left_join(bmi_clean, by = "seqn") %>%
+  filter(age >= 20) %>%
+  mutate(bmxbmi_clean = ifelse(is.nan(bmxbmi_clean), NA_real_, bmxbmi_clean))
+```
+
+## BMI Distribution (AFTER Cleaning)
+
+```{r plot-bmi-after}
+bmi_after_df <- dat_clean %>% transmute(stage = "After (clean BMI)", value = bmxbmi_clean)
+x <- bmi_after_df$value
+qs <- quantile(x, c(.25, .75), na.rm = TRUE)
+iqr <- qs[2] - qs[1]
+upper_whisker <- min(max(x, na.rm = TRUE), qs[2] + 1.5 * iqr)
+bmi_after_label_y <- upper_whisker + 0.05 * iqr
+bmi_after_N <- sum(!is.na(x))
+
+ggplot(bmi_after_df, aes(stage, value, fill = stage)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.15, fatten = 1.2) +
+  geom_text(
+    data = tibble(stage = "After (clean BMI)", y = bmi_after_label_y, N = bmi_after_N),
+    aes(stage, y, label = paste0("n = ", N)), 
+    hjust = -1, size = 3.5, inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = c("After (clean BMI)" = "#FCE5CD")) +
+  labs(title = "BMI (AFTER): Cleaned Distribution", x = NULL, y = "BMI") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  theme_minimal(base_size = 12) + 
+  theme(legend.position = "none", panel.grid.minor = element_blank())
+```
+
+## Missing Value Comparison
+
+```{r missing-comparison-bmi}
+miss_before <- tibble(
+  stage = "Before",
+  variable = "BMI",
+  n_missing = sum(is.na(dat_raw$bmi_raw)),
+  n_total = nrow(dat_raw)
+) %>% mutate(p_missing = n_missing / n_total)
+
+miss_after <- tibble(
+  stage = "After",
+  variable = "BMI",
+  n_missing = sum(is.na(dat_clean$bmxbmi_clean)),
+  n_total = nrow(dat_clean)
+) %>% mutate(p_missing = n_missing / n_total)
+
+miss_long <- bind_rows(miss_before, miss_after) %>%
+  mutate(
+    stage = factor(stage, levels = c("Before", "After")),
+    variable = factor(variable, levels = "BMI")
+  )
+
+pos <- position_dodge(width = 0.65)
+
+ggplot(miss_long, aes(variable, p_missing, fill = stage)) +
+  geom_col(width = 0.6, position = pos) +
+  geom_text(
+    aes(label = paste0(scales::percent(p_missing, 0.1), "\n(", n_missing, "/", n_total, ")")),
+    position = pos, vjust = -0.2, size = 3.5, lineheight = 0.95
+  ) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.12))) +
+  scale_fill_manual(values = c("Before" = "#9EC5FE", "After" = "#FFCF99")) +
+  labs(
+    title = "Missingness (NA) Before vs After Outlier Removal (BMI)",
+    x = NULL, y = "Missing rate", fill = "Stage"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "top"
+  )
+```
+
+---
+
+# Week 5 HW1: Blood Pressure Cleaning & Visualization
+
+## Build BEFORE (Raw) Blood Pressure Dataset
+
+```{r build-raw-bp}
+# Extract raw SBP and DBP
+sbp_raw <- bpx %>%
+  transmute(seqn, SBP_raw = rowMeans(select(., all_of(sbp_cols)), na.rm = TRUE))
+
+dbp_raw <- bpx %>%
+  transmute(seqn, DBP_raw = rowMeans(select(., all_of(dbp_cols)), na.rm = TRUE))
+
+# Combine with demographics
+dat_raw <- demo_sex %>%
+  left_join(sbp_raw, by = "seqn") %>%
+  left_join(dbp_raw, by = "seqn") %>%
+  filter(age >= 20) %>%
+  mutate(
+    SBP_raw = ifelse(is.nan(SBP_raw), NA_real_, SBP_raw),
+    DBP_raw = ifelse(is.nan(DBP_raw), NA_real_, DBP_raw)
+  )
+```
+
+## Blood Pressure Distribution (BEFORE Cleaning)
+
+### SBP Before
+
+```{r plot-sbp-before}
+sbp_before_df <- dat_raw %>% transmute(stage = "Before (raw SBP)", value = SBP_raw)
+x <- sbp_before_df$value
+qs <- quantile(x, c(.25, .75), na.rm = TRUE)
+iqr <- qs[2] - qs[1]
+upper_whisker <- min(max(x, na.rm = TRUE), qs[2] + 1.5 * iqr)
+sbp_before_label_y <- upper_whisker + 0.05 * iqr
+sbp_before_N <- sum(!is.na(x))
+
+ggplot(sbp_before_df, aes(stage, value, fill = stage)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.15, fatten = 1.2) +
+  geom_text(
+    data = tibble(stage = "Before (raw SBP)", y = sbp_before_label_y, N = sbp_before_N),
+    aes(stage, y, label = paste0("n = ", N)), 
+    hjust = -1, size = 3.5, inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = c("Before (raw SBP)" = "#D6E9F8")) +
+  labs(title = "SBP (BEFORE): Raw Distribution", x = NULL, y = "SBP") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  theme_minimal(base_size = 12) + 
+  theme(legend.position = "none", panel.grid.minor = element_blank())
+```
+
+### DBP Before
+
+```{r plot-dbp-before}
+dbp_before_df <- dat_raw %>% transmute(stage = "Before (raw DBP)", value = DBP_raw)
+x <- dbp_before_df$value
+qs <- quantile(x, c(.25, .75), na.rm = TRUE)
+iqr <- qs[2] - qs[1]
+upper_whisker <- min(max(x, na.rm = TRUE), qs[2] + 1.5 * iqr)
+dbp_before_label_y <- upper_whisker + 0.05 * iqr
+dbp_before_N <- sum(!is.na(x))
+
+ggplot(dbp_before_df, aes(stage, value, fill = stage)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.15, fatten = 1.2) +
+  geom_text(
+    data = tibble(stage = "Before (raw DBP)", y = dbp_before_label_y, N = dbp_before_N),
+    aes(stage, y, label = paste0("n = ", N)), 
+    hjust = -1, size = 3.5, inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = c("Before (raw DBP)" = "#D6E9F8")) +
+  labs(title = "DBP (BEFORE): Raw Distribution", x = NULL, y = "DBP") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  theme_minimal(base_size = 12) + 
+  theme(legend.position = "none", panel.grid.minor = element_blank())
+```
+
+## Blood Pressure Outlier Cleaning
+
+```{r clean-bp}
+SBP_LO <- 70
+SBP_HI <- 260
+DBP_LO <- 40
+DBP_HI <- 150
+
+# Clean SBP
+sbp_clean <- bpx %>%
+  transmute(seqn, SBP_raw = rowMeans(select(., all_of(sbp_cols)), na.rm = TRUE)) %>%
+  mutate(
+    q1 = quantile(SBP_raw, 0.25, na.rm = TRUE),
+    q3 = quantile(SBP_raw, 0.75, na.rm = TRUE),
+    iqr = q3 - q1,
+    lo_iqr = q1 - 1.5 * iqr,
+    hi_iqr = q3 + 1.5 * iqr,
+    med = median(SBP_raw, na.rm = TRUE),
+    madv = mad(SBP_raw, na.rm = TRUE),
+    z = ifelse(madv > 0, (SBP_raw - med) / (madv * 1.4826), 0),
+    flag = (SBP_raw < SBP_LO | SBP_raw > SBP_HI) | 
+           (SBP_raw < lo_iqr | SBP_raw > hi_iqr) | 
+           (abs(z) > 3.5),
+    SBP_clean = ifelse(flag, NA_real_, SBP_raw)
+  ) %>% 
+  select(seqn, SBP_clean)
+
+# Clean DBP
+dbp_clean <- bpx %>%
+  transmute(seqn, DBP_raw = rowMeans(select(., all_of(dbp_cols)), na.rm = TRUE)) %>%
+  mutate(
+    q1 = quantile(DBP_raw, 0.25, na.rm = TRUE),
+    q3 = quantile(DBP_raw, 0.75, na.rm = TRUE),
+    iqr = q3 - q1,
+    lo_iqr = q1 - 1.5 * iqr,
+    hi_iqr = q3 + 1.5 * iqr,
+    med = median(DBP_raw, na.rm = TRUE),
+    madv = mad(DBP_raw, na.rm = TRUE),
+    z = ifelse(madv > 0, (DBP_raw - med) / (madv * 1.4826), 0),
+    flag = (DBP_raw < DBP_LO | DBP_raw > DBP_HI) | 
+           (DBP_raw < lo_iqr | DBP_raw > hi_iqr) | 
+           (abs(z) > 3.5),
+    DBP_clean = ifelse(flag, NA_real_, DBP_raw)
+  ) %>% 
+  select(seqn, DBP_clean)
+
+# Build cleaned BP dataset
+dat_clean_bp <- demo_sex %>%
+  left_join(sbp_clean, by = "seqn") %>%
+  left_join(dbp_clean, by = "seqn") %>%
+  filter(age >= 20) %>%
+  mutate(
+    SBP_clean = ifelse(is.nan(SBP_clean), NA_real_, SBP_clean),
+    DBP_clean = ifelse(is.nan(DBP_clean), NA_real_, DBP_clean)
+  )
+```
+
+## Blood Pressure Distribution (AFTER Cleaning)
+
+### SBP After
+
+```{r plot-sbp-after}
+sbp_after_df <- dat_clean_bp %>% transmute(stage = "After (clean SBP)", value = SBP_clean)
+x <- sbp_after_df$value
+qs <- quantile(x, c(.25, .75), na.rm = TRUE)
+iqr <- qs[2] - qs[1]
+upper_whisker <- min(max(x, na.rm = TRUE), qs[2] + 1.5 * iqr)
+sbp_after_label_y <- upper_whisker + 0.05 * iqr
+sbp_after_N <- sum(!is.na(x))
+
+ggplot(sbp_after_df, aes(stage, value, fill = stage)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.15, fatten = 1.2) +
+  geom_text(
+    data = tibble(stage = "After (clean SBP)", y = sbp_after_label_y, N = sbp_after_N),
+    aes(stage, y, label = paste0("n = ", N)), 
+    hjust = -1, size = 3.5, inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = c("After (clean SBP)" = "#FCE5CD")) +
+  labs(title = "SBP (AFTER): Cleaned Distribution", x = NULL, y = "SBP") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  theme_minimal(base_size = 12) + 
+  theme(legend.position = "none", panel.grid.minor = element_blank())
+```
+
+### DBP After
+
+```{r plot-dbp-after}
+dbp_after_df <- dat_clean_bp %>% transmute(stage = "After (clean DBP)", value = DBP_clean)
+x <- dbp_after_df$value
+qs <- quantile(x, c(.25, .75), na.rm = TRUE)
+iqr <- qs[2] - qs[1]
+upper_whisker <- min(max(x, na.rm = TRUE), qs[2] + 1.5 * iqr)
+dbp_after_label_y <- upper_whisker + 0.05 * iqr
+dbp_after_N <- sum(!is.na(x))
+
+ggplot(dbp_after_df, aes(stage, value, fill = stage)) +
+  geom_boxplot(width = 0.6, outlier.alpha = 0.15, fatten = 1.2) +
+  geom_text(
+    data = tibble(stage = "After (clean DBP)", y = dbp_after_label_y, N = dbp_after_N),
+    aes(stage, y, label = paste0("n = ", N)), 
+    hjust = -1, size = 3.5, inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = c("After (clean DBP)" = "#FCE5CD")) +
+  labs(title = "DBP (AFTER): Cleaned Distribution", x = NULL, y = "DBP") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  theme_minimal(base_size = 12) + 
+  theme(legend.position = "none", panel.grid.minor = element_blank())
+```
+
+## Missing Value Comparison (Blood Pressure)
+
+```{r missing-comparison-bp}
+miss_before <- tibble(
+  stage = "Before",
+  variable = c("SBP", "DBP"),
+  n_missing = c(sum(is.na(dat_raw$SBP_raw)), sum(is.na(dat_raw$DBP_raw))),
+  n_total = nrow(dat_raw)
+) %>% mutate(p_missing = n_missing / n_total)
+
+miss_after <- tibble(
+  stage = "After",
+  variable = c("SBP", "DBP"),
+  n_missing = c(sum(is.na(dat_clean_bp$SBP_clean)), sum(is.na(dat_clean_bp$DBP_clean))),
+  n_total = nrow(dat_clean_bp)
+) %>% mutate(p_missing = n_missing / n_total)
+
+miss_long <- bind_rows(miss_before, miss_after) %>%
+  mutate(stage = factor(stage, levels = c("Before", "After")))
+
+ggplot(miss_long, aes(variable, p_missing, fill = stage)) +
+  geom_col(width = 0.6, position = "dodge") +
+  geom_text(
+    aes(label = paste0(scales::percent(p_missing, 0.1), "\n(", n_missing, "/", n_total, ")")),
+    position = position_dodge(width = 0.65), vjust = -0.2, size = 3.5
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("Before" = "#9EC5FE", "After" = "#FFCF99")) +
+  labs(
+    title = "SBP/DBP Missingness Before vs After Cleaning",
+    x = NULL, y = "Missing rate", fill = "Stage"
+  ) +
+  theme_minimal(base_size = 12) + 
+  theme(legend.position = "top")
+```
+
+## Scatter Plot: BMI vs SBP by Sex
+
+```{r scatter-bmi-sbp}
+dat_scatter <- demo_sex %>%
+  left_join(bmi_clean, by = "seqn") %>%
+  left_join(sbp_clean, by = "seqn") %>%
+  filter(age >= 20)
+
+ggplot(dat_scatter, aes(x = bmxbmi_clean, y = SBP_clean, color = sex)) +
+  geom_point(alpha = 0.4, size = 1.2) +
+  labs(
+    title = "Cleaned BMI vs Cleaned SBP by Sex",
+    x = "BMI (cleaned)", 
+    y = "SBP (cleaned)", 
+    color = "Sex"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+### With Regression Lines
+
+```{r scatter-bmi-sbp-lm}
+ggplot(dat_scatter, aes(x = bmxbmi_clean, y = SBP_clean, color = sex)) +
+  geom_point(alpha = 0.4, size = 1.2) +
+  geom_smooth(method = "lm", se = FALSE) +
+  stat_poly_eq(
+    aes(label = paste(after_stat(eq.label), after_stat(rr.label), sep = "~~~")),
+    formula = y ~ x, parse = TRUE, size = 3
+  ) +
+  labs(
+    title = "Cleaned BMI vs Cleaned SBP by Sex (with Regression Lines)",
+    x = "BMI (cleaned)", 
+    y = "SBP (cleaned)", 
+    color = "Sex"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+# Week 6 Class: Education Level Analysis
+
+## Education Level Recoding
+
+```{r edu-recode}
+# Check original coding
+demo %>% count(dmdeduc2) %>% kable(caption = "Original Education Coding")
+```
+
+```{r edu-dataset}
+# Recode and relabel education
+dat_edu <- demo %>%
+  transmute(
+    seqn,
+    age = ridageyr,
+    EDU = case_when(
+      dmdeduc2 %in% 1:5 ~ dmdeduc2,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  mutate(
+    EDU = factor(
+      EDU,
+      levels = 1:5,
+      labels = c("<9th grade", "9-11th grade", "High school/GED", 
+                 "Some college/AA", "College or above")
+    )
+  ) %>%
+  left_join(dat_clean %>% select(seqn, bmxbmi_clean), by = "seqn") %>%
+  drop_na(EDU, bmxbmi_clean)
+```
+
+## Education Distribution Table
+
+```{r edu-distribution}
+edu_dist <- dat_edu %>%
+  count(EDU) %>%
+  mutate(
+    prop = n / sum(n),
+    percentage = paste0(round(prop * 100, 1), "%"),
+    variable = "EDU"
+  ) %>%
+  rename(category = EDU)
+
+kable(edu_dist, digits = 3, caption = "Distribution of Educational Attainment (EDU)")
+```
+
+## BMI by Education Level
+
+```{r plot-bmi-edu}
+dat_edu %>%
+  ggplot(aes(x = EDU, y = bmxbmi_clean)) +
+  geom_boxplot(position = position_dodge(0.8), outlier.alpha = 0.2) +
+  labs(
+    title = "BMI across Education Groups",
+    x = "Education Level", 
+    y = "BMI"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+## Blood Pressure Trials Analysis
+
+```{r bp-long-clean}
+# Transform BP data to long format
+bpx_long_clean <- bpx %>%
+  select(seqn, all_of(c(sbp_cols, dbp_cols))) %>%
+  pivot_longer(
+    cols = -seqn,
+    names_to = c("measure", "trial"),
+    names_pattern = "^bpxo([sd]i|sy)([1-3])$",
+    values_to = "value"
+  ) %>%
+  mutate(
+    measure = recode(measure, "sy" = "SBP", "di" = "DBP"),
+    trial = as.integer(trial)
+  )
+
+ggplot(bpx_long_clean, aes(x = factor(trial), y = value, fill = measure)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  facet_wrap(~ measure, scales = "free_y") +
+  labs(
+    title = "Distribution of SBP & DBP across 3 Trials (Cleaned Data)",
+    x = "Trial", 
+    y = "Blood Pressure (mmHg)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# Week 6 HW2: Race Distribution & BP Trial Selection
+
+## Race/Ethnicity Recoding
+
+```{r race-recode}
+# Check original race coding
+demo %>% count(ridreth3) %>% kable(caption = "Original Race/Ethnicity Coding")
+```
+
+```{r race-dataset}
+# Recode race/ethnicity
+dat_race <- demo %>%
+  transmute(
+    seqn,
+    age = ridageyr,
+    Race = case_when(
+      ridreth3 == 1 ~ "Mexican American",
+      ridreth3 == 2 ~ "Other Hispanic",
+      ridreth3 == 3 ~ "Non-Hispanic White",
+      ridreth3 == 4 ~ "Non-Hispanic Black",
+      ridreth3 == 6 ~ "Non-Hispanic Asian",
+      ridreth3 == 7 ~ "Other/Multi-racial",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  mutate(
+    Race = factor(
+      Race, 
+      levels = c("Mexican American", "Other Hispanic", 
+                 "Non-Hispanic White", "Non-Hispanic Black",
+                 "Non-Hispanic Asian", "Other/Multi-racial")
+    )
+  ) %>%
+  left_join(bmi_clean, by = "seqn") %>%
+  drop_na(Race, bmxbmi_clean)
+```
+
+## Race Distribution Table
+
+```{r race-distribution}
+race_dist <- dat_race %>%
+  count(Race) %>%
+  mutate(
+    prop = n / sum(n),
+    percentage = paste0(round(prop * 100, 1), "%"),
+    variable = "Race"
+  ) %>%
+  rename(category = Race)
+
+kable(
+  race_dist, 
+  digits = 3, 
+  caption = "Distribution of Race/Ethnicity (RIDRETH3)",
+  col.names = c("Race/Ethnicity", "N", "Proportion", "Percentage", "Variable")
+)
+```
+
+## BMI by Race/Ethnicity
+
+```{r plot-bmi-race}
+dat_race %>%
+  ggplot(aes(x = Race, y = bmxbmi_clean, fill = Race)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(
+    title = "BMI Distribution across Race/Ethnicity Groups",
+    x = "Race/Ethnicity", 
+    y = "BMI (kg/m²)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  scale_fill_brewer(palette = "Set3")
+```
+
+## Combined Race and Education Analysis
+
+```{r combined-dataset}
+# Combine race and education data
+dat_combined <- demo %>%
+  transmute(
+    seqn,
+    age = ridageyr,
+    Race = case_when(
+      ridreth3 == 1 ~ "Mexican American",
+      ridreth3 == 2 ~ "Other Hispanic",
+      ridreth3 == 3 ~ "Non-Hispanic White",
+      ridreth3 == 4 ~ "Non-Hispanic Black",
+      ridreth3 == 6 ~ "Non-Hispanic Asian",
+      ridreth3 == 7 ~ "Other/Multi-racial",
+      TRUE ~ NA_character_
+    ),
+    EDU = case_when(
+      dmdeduc2 %in% 1:5 ~ dmdeduc2,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  mutate(
+    Race = factor(
+      Race, 
+      levels = c("Mexican American", "Other Hispanic", 
+                 "Non-Hispanic White", "Non-Hispanic Black",
+                 "Non-Hispanic Asian", "Other/Multi-racial")
+    ),
+    EDU = factor(
+      EDU,
+      levels = 1:5,
+      labels = c("<9th grade", "9-11th grade", "High school/GED", 
+                 "Some college/AA", "College or above")
+    )
+  ) %>%
+  left_join(bmi_clean, by = "seqn") %>%
+  drop_na(Race, EDU, bmxbmi_clean)
+```
+
+### BMI by Race, Stratified by Education
+
+```{r plot-bmi-race-edu}
+dat_combined %>%
+  ggplot(aes(x = Race, y = bmxbmi_clean, fill = EDU)) +
+  geom_boxplot(position = position_dodge(0.8), outlier.alpha = 0.2) +
+  labs(
+    title = "BMI across Race Groups, Stratified by Education Level",
+    x = "Race/Ethnicity", 
+    y = "BMI (kg/m²)",
+    fill = "Education Level"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_brewer(palette = "Set2")
+```
+
+### BMI by Education, Stratified by Race
+
+```{r plot-bmi-edu-race}
+dat_combined %>%
+  ggplot(aes(x = EDU, y = bmxbmi_clean, fill = Race)) +
+  geom_boxplot(position = position_dodge(0.8), outlier.alpha = 0.2) +
+  labs(
+    title = "BMI across Education Levels, Stratified by Race/Ethnicity",
+    x = "Education Level", 
+    y = "BMI (kg/m²)",
+    fill = "Race/Ethnicity"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  scale_fill_brewer(palette = "Set3")
+```
+
+## BP Trial Selection: Maximum Difference
+
+```{r bp-trial-selection}
+# Clean BP data by physiologic bounds
+sbp_raw <- bpx %>%
+  select(seqn, all_of(sbp_cols)) %>%
+  pivot_longer(
+    cols = -seqn,
+    names_to = "trial",
+    names_pattern = "^bpxo?sy([1-3])$",
+    values_to = "value"
+  ) %>%
+  mutate(
+    trial = as.integer(trial),
+    measure = "SBP",
+    value_clean = ifelse(value < SBP_LO | value > SBP_HI, NA_real_, value)
+  ) %>%
+  select(seqn, measure, trial, value, value_clean)
+
+dbp_raw <- bpx %>%
+  select(seqn, all_of(dbp_cols)) %>%
+  pivot_longer(
+    cols = -seqn,
+    names_to = "trial",
+    names_pattern = "^bpxo?di([1-3])$",
+    values_to = "value"
+  ) %>%
+  mutate(
+    trial = as.integer(trial),
+    measure = "DBP",
+    value_clean = ifelse(value < DBP_LO | value > DBP_HI, NA_real_, value)
+  ) %>%
+  select(seqn, measure, trial, value, value_clean)
+
+bpx_clean <- bind_rows(sbp_raw, dbp_raw)
+```
+
+```{r bp-max-diff}
+# Calculate maximum difference between any two trials
+bp_max_diff <- bpx_clean %>%
+  drop_na(value_clean) %>%
+  group_by(seqn, measure) %>%
+  filter(n() >= 2) %>%
+  arrange(trial) %>%
+  mutate(
+    trial_list = list(trial),
+    value_list = list(value_clean)
+  ) %>%
+  distinct(seqn, measure, trial_list, value_list) %>%
+  rowwise() %>%
+  mutate(
+    pair_info = list({
+      t <- trial_list
+      v <- value_list
+      combos <- combn(length(t), 2, simplify = FALSE)
+      pairs <- map_dfr(combos, ~tibble(
+        trial1 = t[.x[1]],
+        trial2 = t[.x[2]],
+        value1 = v[.x[1]],
+        value2 = v[.x[2]],
+        diff = abs(v[.x[1]] - v[.x[2]])
+      ))
+      pairs %>% slice_max(diff, n = 1, with_ties = FALSE)
+    })
+  ) %>%
+  ungroup() %>%
+  unnest(pair_info) %>%
+  select(seqn, measure, trial1, trial2, value1, value2, diff)
+```
+
+```{r bp-two-trials-dataset}
+# Build dataset with only the two trials with maximum difference
+bp_two_trials <- bpx_clean %>%
+  inner_join(
+    bp_max_diff %>%
+      select(seqn, measure, trial1, trial2) %>%
+      pivot_longer(
+        cols = c(trial1, trial2),
+        names_to = "pair_type",
+        values_to = "trial"
+      ),
+    by = c("seqn", "measure", "trial")
+  ) %>%
+  drop_na(value_clean)
+```
+
+### Summary Statistics
+
+```{r bp-summary}
+cat("\n=== Two-Trial Selection Summary ===\n")
+cat("Total subjects with valid BP measurements:\n")
+bp_two_trials %>%
+  distinct(seqn, measure) %>%
+  count(measure) %>%
+  kable(col.names = c("Measure", "N Subjects"))
+```
+
+### Distribution of Selected Two Trials
+
+```{r plot-bp-two-trials}
+bp_two_trials %>%
+  ggplot(aes(x = factor(trial), y = value_clean, fill = measure)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  facet_wrap(~ measure, scales = "free_y") +
+  labs(
+    title = "Distribution of SBP & DBP: Two Trials with Largest Difference",
+    subtitle = "Each subject contributes their two most different measurements",
+    x = "Trial Number",
+    y = "Blood Pressure (mmHg)",
+    fill = "Measure"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("SBP" = "#F8CECC", "DBP" = "#D5E8D4"))
+```
+
+### Comparison: All 3 Trials vs Selected 2 Trials
+
+```{r plot-bp-comparison}
+bp_all_trials <- bpx_clean %>%
+  drop_na(value_clean)
+
+bp_comparison <- bind_rows(
+  bp_all_trials %>% mutate(dataset = "All 3 Trials"),
+  bp_two_trials %>% mutate(dataset = "Max Diff 2 Trials")
+)
+
+bp_comparison %>%
+  ggplot(aes(x = factor(trial), y = value_clean, fill = dataset)) +
+  geom_boxplot(position = position_dodge(0.8), outlier.alpha = 0.15) +
+  facet_wrap(~ measure, scales = "free_y") +
+  labs(
+    title = "Comparison: All 3 Trials vs. Selected 2 Trials (Max Difference)",
+    x = "Trial Number",
+    y = "Blood Pressure (mmHg)",
+    fill = "Dataset"
+  ) +
+  theme_minimal(base_size = 13) +
+  scale_fill_manual(values = c("All 3 Trials" = "#B4D7FF",
+                               "Max Diff 2 Trials" = "#FFB4B4"))
+```
+
+### Summary Table of Two-Trial Selection
+
+```{r bp-two-trials-summary-table}
+bp_two_trials_summary <- bp_two_trials %>%
+  group_by(seqn, measure) %>%
+  summarise(
+    trial_1 = min(trial),
+    trial_2 = max(trial),
+    value_1 = value_clean[trial == min(trial)][1],
+    value_2 = value_clean[trial == max(trial)][1],
+    difference = abs(value_1 - value_2),
+    .groups = "drop"
+  )
+
+# Display first 20 rows
+bp_two_trials_summary %>%
+  head(20) %>%
+  kable(
+    digits = 2,
+    caption = "Two-Trial Selection Summary (First 20 Subjects)",
+    col.names = c("SEQN", "Measure", "Trial 1", "Trial 2", 
+                  "Value 1", "Value 2", "Difference")
+  )
+```
+
+---
+
+# Conclusion
+
+This analysis of **NHANES 2021–2023** data revealed several clear demographic and physiological patterns:
+
+- **BMI distribution:** After cleaning outliers using physiologic limits and IQR/MAD thresholds, the adult sample (n ≈ 8,800) showed a median BMI around **26.4 kg/m²**, with the interquartile range (IQR) spanning roughly **21.6–31.7**.  
+  BMI variability was notably higher among **Non-Hispanic Black participants** (median ≈ 32) and among those with **lower education levels** (e.g., < high school: median ≈ 30–32).
+
+- **Education and race differences:**  
+  Individuals with **college or above education (35.9%)** tended to have lower BMI values, while those with less than high school education (≈4.8%) showed higher medians.  
+  Across race/ethnicity, **Non-Hispanic White** comprised the largest group (53.4%), followed by **Non-Hispanic Black (12.7%)** and **Hispanic subgroups (≈20%)**.  
+  Combined analysis of education × race demonstrated that education effects persisted across racial groups, though magnitudes varied.
+
+- **BMI and blood pressure association:**  
+  Regression lines between **BMI and SBP** indicated a weak but positive relationship, differing slightly by sex, with **R² ≈ 0.01**.  
+  Males tended to have slightly higher SBP at comparable BMI levels, though both sexes exhibited wide individual variability.
+
+- **Blood pressure measurements:**  
+  After cleaning, the SBP distribution centered around **~118 mmHg**, DBP around **~72 mmHg**.  
+  Variability across three BP trials was modest but nontrivial; selecting the **two trials with the largest differences** revealed deviations up to **24 mmHg in SBP** and **10–15 mmHg in DBP** for some participants, highlighting measurement instability in a subset of subjects.
+
+---
+
+Through this project, I learned the importance of maintaining **reproducible analytical workflows**—from modular code organization (data cleaning, visualization, regression) to **Quarto-based automated reporting** and version-controlled outputs (plots, CSVs).  
+This ensures transparent, replicable results and facilitates future extensions such as modeling BMI–BP associations adjusting for age, sex, and socioeconomic variables.
+
+```{r session-info}
+sessionInfo()
+```
